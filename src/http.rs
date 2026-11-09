@@ -1,21 +1,26 @@
-//! HTTP/1.x message types, parsing and serialization.
-
+//! HTTP/1.x 工具：请求/响应解析、头部校验、body framing、错误与默认响应序列化。
 use std::fmt;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+// HTTP 头部大小上限。
 pub const MAX_HEAD_SIZE: usize = 64 * 1024;
+// 单个消息的头部数量上限。
 pub const MAX_HEADERS: usize = 200;
-/// Absolute cap used when `http_body_max_size` is not configured.
+
+// 未配置时请求体的默认上限（64 MiB）。
 pub const DEFAULT_BODY_MAX: u64 = 64 * 1024 * 1024;
 
+/// HTTP 版本。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Version {
     Http10,
     Http11,
 }
 
+/// HTTP 版本相关方法。
 impl Version {
+    /// 返回 HTTP/1.0 或 HTTP/1.1 字符串。
     pub fn as_str(self) -> &'static str {
         match self {
             Version::Http10 => "HTTP/1.0",
@@ -24,12 +29,14 @@ impl Version {
     }
 }
 
+/// 一个 HTTP 头键值对。
 #[derive(Clone, Debug)]
 pub struct Header {
     pub name: String,
     pub value: String,
 }
 
+/// 请求头解析结果：方法、路径、版本和 body framing 信息。
 #[derive(Clone, Debug)]
 pub struct RequestHead {
     pub method: String,
@@ -44,15 +51,19 @@ pub struct RequestHead {
     pub expect_continue: bool,
 }
 
+/// 请求头查询辅助。
 impl RequestHead {
+    /// 按名称取第一个头值。
     pub fn header(&self, name: &str) -> Option<&str> {
         header(&self.headers, name)
     }
 
+    /// 按名称取所有同名头值。
     pub fn header_all(&self, name: &str) -> Vec<&str> {
         header_all(&self.headers, name)
     }
 
+    /// 判断指定头是否包含某个逗号分隔的 token。
     pub fn header_contains_token(&self, name: &str, token: &str) -> bool {
         self.header_all(name)
             .iter()
@@ -60,26 +71,32 @@ impl RequestHead {
     }
 }
 
+/// 完整请求：请求头加已读取的 body。
 #[derive(Clone, Debug)]
 pub struct Request {
     pub head: RequestHead,
     pub body: Vec<u8>,
 }
 
+/// 请求头查询辅助。
 impl Request {
+    /// 按名称取第一个头值。
     pub fn header(&self, name: &str) -> Option<&str> {
         self.head.header(name)
     }
 
+    /// 按名称取所有同名头值。
     pub fn header_all(&self, name: &str) -> Vec<&str> {
         self.head.header_all(name)
     }
 
+    /// 判断指定头是否包含某个 token。
     pub fn header_contains_token(&self, name: &str, token: &str) -> bool {
         self.head.header_contains_token(name, token)
     }
 }
 
+/// 后端响应头解析结果。
 #[derive(Clone, Debug)]
 pub struct ResponseHead {
     pub version: Version,
@@ -88,16 +105,20 @@ pub struct ResponseHead {
     pub headers: Vec<Header>,
 }
 
+/// 响应头查询辅助。
 impl ResponseHead {
+    /// 按名称取第一个响应头值。
     pub fn header(&self, name: &str) -> Option<&str> {
         header(&self.headers, name)
     }
 
+    /// 按名称取所有同名响应头值。
     pub fn header_all(&self, name: &str) -> Vec<&str> {
         header_all(&self.headers, name)
     }
 }
 
+/// 响应 body 的 framing 方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyFraming {
     None,
@@ -106,13 +127,16 @@ pub enum BodyFraming {
     UntilEof,
 }
 
+/// 带 HTTP 状态码的错误。
 #[derive(Debug)]
 pub struct HttpError {
     pub status: u16,
     pub message: String,
 }
 
+/// HttpError 构造辅助。
 impl HttpError {
+    /// 创建指定状态码和消息的错误。
     pub fn new(status: u16, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -120,31 +144,34 @@ impl HttpError {
         }
     }
 
+    /// 创建 400 错误。
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(400, message)
     }
 
+    /// 创建 413 错误。
     pub fn too_large(message: impl Into<String>) -> Self {
         Self::new(413, message)
     }
 
+    /// 创建 502 上游错误。
     pub fn upstream(message: impl Into<String>) -> Self {
         Self::new(502, message)
     }
 }
 
+/// 输出状态码和消息。
 impl fmt::Display for HttpError {
+    /// 格式化错误文本。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.status, self.message)
     }
 }
 
+/// 让 HttpError 可作为标准错误使用。
 impl std::error::Error for HttpError {}
 
-/* ------------------------------------------------------------------ */
-/* Header helpers                                                     */
-/* ------------------------------------------------------------------ */
-
+/// 在头部数组中按名称查找第一个值。
 pub fn header<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -152,6 +179,7 @@ pub fn header<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
         .map(|h| h.value.as_str())
 }
 
+/// 在头部数组中查找所有同名值。
 pub fn header_all<'a>(headers: &'a [Header], name: &str) -> Vec<&'a str> {
     headers
         .iter()
@@ -160,6 +188,7 @@ pub fn header_all<'a>(headers: &'a [Header], name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// 判断头部值是否包含指定 token。
 pub fn header_contains_token(value: &str, token: &str) -> bool {
     value.split(',').any(|part| {
         part.split(';')
@@ -170,6 +199,7 @@ pub fn header_contains_token(value: &str, token: &str) -> bool {
     })
 }
 
+/// 判断是否为 hop-by-hop 头。
 pub fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -185,7 +215,7 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Header names listed in the `Connection` header are themselves hop-by-hop.
+/// 收集 Connection 头中列出的 hop-by-hop 头名。
 pub fn connection_tokens(headers: &[Header]) -> Vec<String> {
     let mut out = Vec::new();
     for v in header_all(headers, "connection") {
@@ -199,22 +229,26 @@ pub fn connection_tokens(headers: &[Header]) -> Vec<String> {
     out
 }
 
+/// 判断字符串是否符合 HTTP token 规则。
 pub fn is_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// 判断字符串是否含控制字符。
 fn has_ctl(s: &str) -> bool {
     s.chars().any(|c| (c < ' ' && c != '\t') || c == '\x7f')
 }
 
+/// 去除头值中的 CR/LF/NUL，防止头注入。
 pub fn sanitize_header_value(v: &str) -> String {
     v.chars()
         .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
         .collect()
 }
 
+/// 返回常见状态码的原因短语。
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         100 => "Continue",
@@ -251,12 +285,7 @@ pub fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Low-level line reader                                              */
-/* ------------------------------------------------------------------ */
-
-/// Read one line, keeping the original EOL bytes. Returns `None` at EOF when
-/// nothing was read. `total` is shared across all lines of one header block.
+/// 读取一行原始字节，并限制整个头块大小。
 async fn read_raw_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     total: &mut usize,
@@ -304,8 +333,7 @@ async fn read_raw_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// Read one raw line from a wire stream (used for chunked encoding and WebSocket
-/// handshakes). The returned bytes include the original EOL.
+/// 读取一行原始字节，供 chunked 解析使用。
 pub async fn read_wire_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, HttpError> {
@@ -313,6 +341,7 @@ pub async fn read_wire_line<R: AsyncBufRead + Unpin>(
     read_raw_line(reader, &mut total, 502).await
 }
 
+/// 去掉行尾的 CR/LF。
 fn strip_eol(mut line: Vec<u8>) -> Vec<u8> {
     if line.last() == Some(&b'\n') {
         line.pop();
@@ -323,14 +352,12 @@ fn strip_eol(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
+/// 把原始行转换为字符串并去掉行尾。
 fn line_string(line: Vec<u8>) -> String {
     String::from_utf8_lossy(&strip_eol(line)).into_owned()
 }
 
-/* ------------------------------------------------------------------ */
-/* Request parsing                                                    */
-/* ------------------------------------------------------------------ */
-
+/// 读取并校验请求行与请求头。
 pub async fn read_request_head<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<RequestHead>, HttpError> {
@@ -451,6 +478,7 @@ pub async fn read_request_head<R: AsyncBufRead + Unpin>(
     }))
 }
 
+/// 按 Content-Length 或 chunked 读取请求体。
 pub async fn read_request_body<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     head: &RequestHead,
@@ -478,6 +506,7 @@ pub async fn read_request_body<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// 解码 chunked 请求体并检查大小上限。
 async fn read_chunked_body<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max_size: u64,
@@ -494,7 +523,6 @@ async fn read_chunked_body<R: AsyncBufRead + Unpin>(
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|_| HttpError::bad_request("invalid chunk size"))?;
         if size == 0 {
-            // Consume trailers until the empty line.
             loop {
                 let raw = read_raw_line(reader, &mut line_total, 400)
                     .await?
@@ -530,7 +558,7 @@ async fn read_chunked_body<R: AsyncBufRead + Unpin>(
     Ok(body)
 }
 
-/// Reads a complete request (head + body). Returns `None` on a clean EOF.
+/// 读取完整请求（头和 body），供测试使用。
 #[allow(dead_code)]
 pub async fn read_request<R: AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -544,6 +572,7 @@ pub async fn read_request<R: AsyncBufRead + Unpin>(
     Ok(Some(Request { head, body }))
 }
 
+/// 拆分请求目标中的路径和 query。
 fn split_target(target: &str) -> Result<(String, String), HttpError> {
     let mut rest = target;
     if let Some(idx) = target.find("://") {
@@ -566,6 +595,7 @@ fn split_target(target: &str) -> Result<(String, String), HttpError> {
     Ok((path.to_string(), query.to_string()))
 }
 
+/// 校验 Content-Length 和 Transfer-Encoding，确定 body 读取方式。
 fn parse_body_headers(headers: &[Header]) -> Result<(Option<u64>, bool), HttpError> {
     let te_values = header_all(headers, "transfer-encoding");
     let chunked = !te_values.is_empty();
@@ -621,11 +651,7 @@ fn parse_body_headers(headers: &[Header]) -> Result<(Option<u64>, bool), HttpErr
     Ok((parsed, false))
 }
 
-/* ------------------------------------------------------------------ */
-/* Response parsing                                                   */
-/* ------------------------------------------------------------------ */
-
-/// Read the raw bytes of a response header block (through the final CRLF).
+/// 读取后端响应头原始字节。
 pub async fn read_raw_response_head<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Vec<u8>, HttpError> {
@@ -643,6 +669,7 @@ pub async fn read_raw_response_head<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// 解析后端状态行和响应头。
 pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead, HttpError> {
     let text = String::from_utf8_lossy(raw);
     let mut lines = text.split('\n');
@@ -712,6 +739,7 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead, HttpError> {
     })
 }
 
+/// 读取最终响应头，跳过 1xx 临时响应。
 pub async fn read_response_head<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<ResponseHead, HttpError> {
@@ -719,14 +747,13 @@ pub async fn read_response_head<R: AsyncBufRead + Unpin>(
         let raw = read_raw_response_head(reader).await?;
         let head = parse_response_head(&raw)?;
         if (100..200).contains(&head.status) && head.status != 101 {
-            // Informational response (e.g. 100 Continue). We stripped Expect
-            // before forwarding, so simply keep reading the final response.
             continue;
         }
         return Ok(head);
     }
 }
 
+/// 根据方法和响应头确定 body 的 framing 方式。
 pub fn response_framing(method: &str, head: &ResponseHead) -> Result<BodyFraming, HttpError> {
     if method.eq_ignore_ascii_case("HEAD")
         || head.status == 101
@@ -766,6 +793,7 @@ pub fn response_framing(method: &str, head: &ResponseHead) -> Result<BodyFraming
     Ok(BodyFraming::UntilEof)
 }
 
+/// 判断后端连接是否可继续复用。
 #[allow(dead_code)]
 pub fn response_keepalive(head: &ResponseHead, framing: BodyFraming) -> bool {
     if framing == BodyFraming::UntilEof || head.status == 101 {
@@ -787,10 +815,7 @@ pub fn response_keepalive(head: &ResponseHead, framing: BodyFraming) -> bool {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Response writer                                                    */
-/* ------------------------------------------------------------------ */
-
+/// 写出状态行、固定头和 body 的简单响应。
 pub async fn write_simple_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     version: Version,
@@ -827,20 +852,19 @@ pub async fn write_simple_response<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-/* ------------------------------------------------------------------ */
-/* Tests                                                              */
-/* ------------------------------------------------------------------ */
-
+// HTTP 解析与 framing 单元测试。
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::BufReader;
 
+    /// 测试辅助：解析请求头。
     async fn head(input: &[u8]) -> RequestHead {
         let mut reader = BufReader::new(input);
         read_request_head(&mut reader).await.unwrap().unwrap()
     }
 
+    /// 验证基本 GET 请求解析。
     #[tokio::test]
     async fn parses_simple_get() {
         let h = head(b"GET /hello?x=1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
@@ -853,6 +877,7 @@ mod tests {
         assert_eq!(h.header("host"), Some("example.com"));
     }
 
+    /// 验证 HTTP/1.0 的 keepalive 规则。
     #[tokio::test]
     async fn http10_keepalive_requires_header() {
         let h = head(b"GET / HTTP/1.0\r\n\r\n").await;
@@ -861,6 +886,7 @@ mod tests {
         assert!(h.keepalive);
     }
 
+    /// 验证 Content-Length body 读取。
     #[tokio::test]
     async fn reads_content_length_body() {
         let mut reader = BufReader::new(&b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"[..]);
@@ -868,6 +894,7 @@ mod tests {
         assert_eq!(req.body, b"hello");
     }
 
+    /// 验证 chunked body 解码。
     #[tokio::test]
     async fn decodes_chunked_body() {
         let input =
@@ -877,6 +904,7 @@ mod tests {
         assert_eq!(req.body, b"hello world");
     }
 
+    /// 验证响应头解析和 framing 判断。
     #[tokio::test]
     async fn parses_response_and_framing() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n";

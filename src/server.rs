@@ -1,5 +1,4 @@
-//! Listener setup, virtual-host routing and per-connection HTTP loops.
-
+//! 服务器接入层：监听端口、accept 连接、虚拟主机/location 路由和每连接主循环。
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -15,8 +14,10 @@ use crate::log;
 use crate::proxy;
 use crate::upstream::{UpstreamGroup, UpstreamPool};
 
+// 客户端连接空闲超时。
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 全局共享运行上下文：配置、upstream 组、连接池和连接数限制。
 pub struct App {
     pub cfg: Arc<Config>,
     pub upstreams: HashMap<String, Arc<UpstreamGroup>>,
@@ -24,7 +25,9 @@ pub struct App {
     pub conn_limit: Arc<Semaphore>,
 }
 
+/// App 的构造。
 impl App {
+    /// 创建 upstream 运行时组和连接信号量。
     pub fn new(cfg: Arc<Config>) -> Self {
         let upstreams = cfg
             .http
@@ -45,12 +48,14 @@ impl App {
     }
 }
 
+/// 一个监听地址及其对应的 server 配置索引。
 struct ListenerSpec {
     ip: IpAddr,
     port: u16,
     servers: Vec<usize>,
 }
 
+/// 启动监听、accept 循环、空闲连接清理，并等待关闭信号。
 pub async fn run(cfg: Arc<Config>, shutdown: watch::Receiver<bool>) -> std::io::Result<()> {
     let specs = build_listener_specs(&cfg);
     if specs.is_empty() {
@@ -101,7 +106,6 @@ pub async fn run(cfg: Arc<Config>, shutdown: watch::Receiver<bool>) -> std::io::
         ));
     }
 
-    // Periodically close idle upstream connections.
     {
         let app = app.clone();
         let mut shutdown = shutdown.clone();
@@ -135,6 +139,7 @@ pub async fn run(cfg: Arc<Config>, shutdown: watch::Receiver<bool>) -> std::io::
     Ok(())
 }
 
+/// 等待 shutdown watch 变为 true。
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     if *shutdown.borrow() {
         return;
@@ -146,6 +151,7 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// 按绑定 IP 和端口合并 server 块。
 fn build_listener_specs(cfg: &Config) -> Vec<ListenerSpec> {
     let mut map: HashMap<(IpAddr, u16), Vec<usize>> = HashMap::new();
     for (idx, server) in cfg.http.servers.iter().enumerate() {
@@ -162,6 +168,7 @@ fn build_listener_specs(cfg: &Config) -> Vec<ListenerSpec> {
     specs
 }
 
+/// 创建并绑定 TCP 监听 socket。
 async fn bind_listener(ip: IpAddr, port: u16) -> std::io::Result<TcpListener> {
     let socket = match ip {
         IpAddr::V4(_) => TcpSocket::new_v4()?,
@@ -172,6 +179,7 @@ async fn bind_listener(ip: IpAddr, port: u16) -> std::io::Result<TcpListener> {
     socket.listen(511)
 }
 
+/// 接收连接，按执行模型交给异步任务或独立线程。
 async fn accept_loop(
     listener: Arc<TcpListener>,
     app: Arc<App>,
@@ -263,6 +271,7 @@ async fn accept_loop(
     }
 }
 
+/// 单个客户端的 keepalive 主循环。
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -376,7 +385,6 @@ async fn handle_connection(
             }
         }
 
-        // No proxy_pass: built-in default content handler.
         let keepalive = req.head.keepalive;
         let body = b"Hello from RPS!\n";
         match http::write_simple_response(
@@ -401,6 +409,7 @@ async fn handle_connection(
     Ok(())
 }
 
+/// 向客户端发送简单错误响应并关闭连接。
 async fn send_simple_error(reader: &mut BufReader<TcpStream>, status: u16, message: &str) {
     let reason = http::reason_phrase(status);
     let body = format!(
@@ -423,6 +432,7 @@ async fn send_simple_error(reader: &mut BufReader<TcpStream>, status: u16, messa
     .await;
 }
 
+/// 根据监听端口和 Host 选择虚拟主机。
 fn select_server<'a>(
     cfg: &'a Config,
     servers: &[usize],
@@ -442,15 +452,15 @@ fn select_server<'a>(
         }
     }
 
-    // No virtual host matched: the first server for this listening socket is
-    // the default server.
     servers.first().map(|&i| &cfg.http.servers[i])
 }
 
+/// 比较 Host 与 server_name，忽略大小写和端口。
 fn server_name_matches(name: &str, host: &str) -> bool {
     name.eq_ignore_ascii_case(host) || strip_port(name).eq_ignore_ascii_case(&strip_port(host))
 }
 
+/// 去掉 host 中的端口部分。
 fn strip_port(host: &str) -> String {
     if host.starts_with('[') {
         if let Some(end) = host.find(']') {
@@ -465,6 +475,7 @@ fn strip_port(host: &str) -> String {
     host.to_string()
 }
 
+/// 按最长前缀匹配 location，未命中时回退第一个。
 fn select_location<'a>(server: &'a ServerConfig, path: &str) -> Option<&'a LocationConfig> {
     let mut best: Option<&LocationConfig> = None;
     for loc in &server.locations {
@@ -477,6 +488,6 @@ fn select_location<'a>(server: &'a ServerConfig, path: &str) -> Option<&'a Locat
             }
         }
     }
-    // The original RPS falls back to the first location when nothing matches.
+
     best.or_else(|| server.locations.first())
 }

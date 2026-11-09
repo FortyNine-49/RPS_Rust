@@ -1,6 +1,4 @@
-//! Upstream runtime state: smooth weighted round-robin and the keepalive
-//! connection cache.
-
+//! upstream 运行时：平滑加权轮询、节点健康状态和 keepalive 连接池。
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -9,6 +7,7 @@ use tokio::net::TcpStream;
 
 use crate::config::UpstreamConfig;
 
+/// 节点的运行时状态：权重、失败次数和冷却时间。
 #[derive(Debug)]
 struct PeerState {
     current_weight: i64,
@@ -17,12 +16,15 @@ struct PeerState {
     failed_at: Option<Instant>,
 }
 
+/// 一个 upstream 组：静态配置加可变节点状态。
 pub struct UpstreamGroup {
     pub cfg: UpstreamConfig,
     state: Mutex<Vec<PeerState>>,
 }
 
+/// upstream 组的选择与健康状态维护。
 impl UpstreamGroup {
+    /// 根据配置创建节点运行时状态。
     pub fn new(cfg: UpstreamConfig) -> Self {
         let state = cfg
             .peers
@@ -40,12 +42,12 @@ impl UpstreamGroup {
         }
     }
 
+    /// 获取节点状态的互斥锁。
     fn lock_state(&self) -> std::sync::MutexGuard<'_, Vec<PeerState>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Smooth weighted round-robin, mirroring the original RPS algorithm.
-    /// `exclude` is used to retry another peer after a connect failure.
+    /// 平滑加权轮询选择一个节点，支持排除已重试节点。
     pub fn select(&self, exclude: &[usize]) -> Option<usize> {
         let mut states = self.lock_state();
         let now = Instant::now();
@@ -104,7 +106,6 @@ impl UpstreamGroup {
             return Some(idx);
         }
 
-        // No primary available: fall back to a backup.
         let (idx, _) = backup_best?;
         let eff = states[idx].effective_weight;
         states[idx].current_weight += eff;
@@ -114,6 +115,7 @@ impl UpstreamGroup {
         Some(idx)
     }
 
+    /// 记录节点失败，增加失败计数并降低有效权重。
     pub fn mark_failure(&self, idx: usize) {
         let mut states = self.lock_state();
         if let Some(st) = states.get_mut(idx) {
@@ -125,6 +127,7 @@ impl UpstreamGroup {
         }
     }
 
+    /// 记录节点成功，清零失败状态。
     pub fn mark_success(&self, idx: usize) {
         let mut states = self.lock_state();
         if let Some(st) = states.get_mut(idx) {
@@ -134,23 +137,22 @@ impl UpstreamGroup {
         }
     }
 
+    /// 返回节点主机和端口。
     pub fn address(&self, idx: usize) -> (&str, u16) {
         let p = &self.cfg.peers[idx];
         (&p.host, p.port)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Keepalive connection pool                                          */
-/* ------------------------------------------------------------------ */
-
+/// 池中的空闲连接及其使用计数。
 struct PooledConn {
     stream: TcpStream,
-    /// Number of requests already sent on this connection.
+
     uses: usize,
     idle_since: Instant,
 }
 
+/// 连接池键：upstream 组、主机和端口。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PoolKey {
     group: String,
@@ -158,22 +160,25 @@ struct PoolKey {
     port: u16,
 }
 
+/// 全局 keepalive 连接池。
 #[derive(Default)]
 pub struct UpstreamPool {
     inner: Mutex<HashMap<PoolKey, Vec<PooledConn>>>,
 }
 
+/// 连接池的存取与清理。
 impl UpstreamPool {
+    /// 创建空连接池。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 获取连接池互斥锁。
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PoolKey, Vec<PooledConn>>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Take a cached connection for this upstream address (LIFO), pruning
-    /// entries that exceeded the idle timeout.
+    /// LIFO 取出一个未过期的空闲连接。
     pub fn take(
         &self,
         group: &str,
@@ -196,8 +201,7 @@ impl UpstreamPool {
         Some((entry.stream, entry.uses))
     }
 
-    /// Return a connection to the cache if the group still has capacity.
-    /// A stream passed to this function is closed when it is not cached.
+    /// 归还连接；超出容量或过期则丢弃。
     #[allow(clippy::too_many_arguments)]
     pub fn put(
         &self,
@@ -237,7 +241,7 @@ impl UpstreamPool {
         });
     }
 
-    /// Drop idle connections whose per-group timeout has expired.
+    /// 清理超过各 upstream 组空闲超时的连接。
     pub fn prune(&self, timeouts: &HashMap<String, Duration>) {
         let mut map = self.lock();
         let keys: Vec<PoolKey> = map.keys().cloned().collect();
@@ -256,16 +260,19 @@ impl UpstreamPool {
         }
     }
 
+    /// 返回当前空闲连接总数。
     pub fn idle_count(&self) -> usize {
         self.lock().values().map(|v| v.len()).sum()
     }
 }
 
+// upstream 调度与连接池单元测试。
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PeerConfig;
 
+    /// 测试辅助：构造节点配置。
     fn peer(weight: i64, backup: bool) -> PeerConfig {
         PeerConfig {
             host: "127.0.0.1".to_string(),
@@ -276,6 +283,7 @@ mod tests {
         }
     }
 
+    /// 验证 3:1 平滑加权轮询的比例。
     #[test]
     fn smooth_weighted_round_robin() {
         let group = UpstreamGroup::new(UpstreamConfig {
@@ -294,6 +302,7 @@ mod tests {
         assert_eq!(counts[1], 100);
     }
 
+    /// 验证 backup 只在主节点不可用时生效。
     #[test]
     fn backup_is_used_only_when_primary_is_unavailable() {
         let mut group = UpstreamGroup::new(UpstreamConfig {
@@ -307,13 +316,13 @@ mod tests {
             assert_eq!(group.select(&[]), Some(0));
         }
 
-        // Mark the primary down permanently.
         group.cfg.peers[0].down = true;
         for _ in 0..10 {
             assert_eq!(group.select(&[]), Some(1));
         }
     }
 
+    /// 验证失败主节点在冷却期内被跳过。
     #[test]
     fn failed_primary_is_skipped_during_cooldown() {
         let group = UpstreamGroup::new(UpstreamConfig {

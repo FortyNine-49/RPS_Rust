@@ -1,25 +1,18 @@
-//! nginx-style configuration parser for RPS.
-//!
-//! Grammar:
-//!   directive arg1 arg2 ... ;
-//!   directive arg1 ... { ... }
-//! `#` starts a comment. Quoted strings are supported. Braces and semicolons
-//! must be separated by whitespace only when they are part of a word.
-
+//! 配置解析：把 nginx 风格配置文本解析为强类型 Config，并完成语义校验。
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
+/// 执行模型：事件驱动 Reactor 或一连接一线程。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UseMode {
-    /// Event driven. In this rewrite this maps to Tokio's multi-threaded
-    /// reactor (epoll on Linux, IOCP on Windows).
     Reactor,
-    /// One dedicated OS thread per client connection.
+
     Thread,
 }
 
+/// 完整配置：全局指令、事件配置和 HTTP 配置。
 #[derive(Clone, Debug)]
 pub struct Config {
     pub worker_processes: usize,
@@ -30,7 +23,9 @@ pub struct Config {
     pub http: HttpConfig,
 }
 
+/// 全局配置默认值。
 impl Default for Config {
+    /// 默认 1 个 worker、前台运行、epoll 和 512 个连接。
     fn default() -> Self {
         Self {
             worker_processes: 1,
@@ -43,6 +38,7 @@ impl Default for Config {
     }
 }
 
+/// http {} 块配置：body 上限、upstream 组和 server 列表。
 #[derive(Clone, Debug, Default)]
 pub struct HttpConfig {
     pub body_max_size: Option<u64>,
@@ -50,6 +46,7 @@ pub struct HttpConfig {
     pub servers: Vec<ServerConfig>,
 }
 
+/// upstream {} 块配置：节点、权重和 keepalive 参数。
 #[derive(Clone, Debug)]
 pub struct UpstreamConfig {
     pub name: String,
@@ -59,6 +56,7 @@ pub struct UpstreamConfig {
     pub keepalive_requests: usize,
 }
 
+/// 单个后端节点的静态配置。
 #[derive(Clone, Debug)]
 pub struct PeerConfig {
     pub host: String,
@@ -70,7 +68,9 @@ pub struct PeerConfig {
     pub backup: bool,
 }
 
+/// 后端节点默认值。
 impl Default for PeerConfig {
+    /// 默认权重 1、max_fails 1、失败冷却 10 秒。
     fn default() -> Self {
         Self {
             host: String::new(),
@@ -84,6 +84,7 @@ impl Default for PeerConfig {
     }
 }
 
+/// server {} 块配置：监听地址、虚拟主机名和 location 列表。
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen_ip: Option<IpAddr>,
@@ -93,6 +94,7 @@ pub struct ServerConfig {
     pub locations: Vec<LocationConfig>,
 }
 
+/// location {} 块配置：路径前缀和可选代理配置。
 #[derive(Clone, Debug)]
 pub struct LocationConfig {
     pub pattern: String,
@@ -100,15 +102,13 @@ pub struct LocationConfig {
     pub body_max_size: Option<u64>,
 }
 
+/// 代理配置：目标地址、超时、头部改写和透传开关。
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub raw: String,
-    /// Candidate `upstream {}` name. At runtime the actual upstream block is
-    /// looked up by this name; when absent the host is used directly.
     pub upstream_name: Option<String>,
     pub target_host: String,
     pub target_port: u16,
-    /// Explicit path from `proxy_pass` (may include a query string).
     pub target_uri: Option<String>,
     pub set_headers: Vec<(String, String)>,
     pub connect_timeout: Duration,
@@ -119,7 +119,9 @@ pub struct ProxyConfig {
     pub pass_request_body: bool,
 }
 
+/// 代理配置默认值。
 impl Default for ProxyConfig {
+    /// 默认 60 秒超时、透传头部和 body、启用 buffering。
     fn default() -> Self {
         Self {
             raw: String::new(),
@@ -138,13 +140,16 @@ impl Default for ProxyConfig {
     }
 }
 
+/// 带行号的配置解析错误。
 #[derive(Debug)]
 pub struct ConfigError {
     pub line: usize,
     pub message: String,
 }
 
+/// ConfigError 构造辅助。
 impl ConfigError {
+    /// 创建带行号的配置错误。
     fn new(line: usize, message: impl Into<String>) -> Self {
         Self {
             line,
@@ -153,7 +158,9 @@ impl ConfigError {
     }
 }
 
+/// 输出行号和错误信息。
 impl fmt::Display for ConfigError {
+    /// 格式化错误文本。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.line > 0 {
             write!(f, "line {}: {}", self.line, self.message)
@@ -163,12 +170,10 @@ impl fmt::Display for ConfigError {
     }
 }
 
+/// 让 ConfigError 可作为标准错误使用。
 impl std::error::Error for ConfigError {}
 
-/* ------------------------------------------------------------------ */
-/* Lexer                                                              */
-/* ------------------------------------------------------------------ */
-
+/// 配置词法单元：单词、花括号、分号和 EOF。
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Word(String),
@@ -178,13 +183,16 @@ enum Token {
     Eof,
 }
 
+/// 配置文本词法分析器，记录当前行号。
 struct Lexer {
     chars: Vec<char>,
     pos: usize,
     line: usize,
 }
 
+/// Lexer 的内部实现。
 impl Lexer {
+    /// 基于配置文本创建 lexer。
     fn new(text: &str) -> Self {
         Self {
             chars: text.chars().collect(),
@@ -193,10 +201,12 @@ impl Lexer {
         }
     }
 
+    /// 查看当前字符但不前进。
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
 
+    /// 读取一个字符并维护行号。
     fn bump(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.pos += 1;
@@ -206,6 +216,7 @@ impl Lexer {
         Some(c)
     }
 
+    /// 跳过空白和 # 注释。
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
@@ -225,6 +236,7 @@ impl Lexer {
         }
     }
 
+    /// 读取下一个 token，并处理引号和转义。
     fn next_token(&mut self) -> Result<(Token, usize), ConfigError> {
         self.skip_trivia();
         let line = self.line;
@@ -287,10 +299,7 @@ impl Lexer {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Syntax tree                                                        */
-/* ------------------------------------------------------------------ */
-
+/// 语法树节点：指令名、参数、子块和行号。
 #[derive(Debug)]
 struct Directive {
     name: String,
@@ -299,6 +308,7 @@ struct Directive {
     line: usize,
 }
 
+/// 递归解析指令序列和 {} 块。
 fn parse_directives(lexer: &mut Lexer, nested: bool) -> Result<Vec<Directive>, ConfigError> {
     let mut out = Vec::new();
     loop {
@@ -320,7 +330,6 @@ fn parse_directives(lexer: &mut Lexer, nested: bool) -> Result<Vec<Directive>, C
                 return Err(ConfigError::new(line, "unexpected '}'"));
             }
             Token::Semi => {
-                // Tolerate stray semicolons.
                 continue;
             }
             Token::LBrace => {
@@ -366,10 +375,7 @@ fn parse_directives(lexer: &mut Lexer, nested: bool) -> Result<Vec<Directive>, C
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Entry point                                                        */
-/* ------------------------------------------------------------------ */
-
+/// 读取配置文件并解析成 Config。
 pub fn parse_config(path: &Path) -> Result<Config, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         ConfigError::new(0, format!("failed to read \"{}\": {}", path.display(), e))
@@ -380,6 +386,7 @@ pub fn parse_config(path: &Path) -> Result<Config, ConfigError> {
     parse_main(&directives)
 }
 
+/// 解析 main 上下文：worker_processes、daemon、pid、event 和 http。
 fn parse_main(directives: &[Directive]) -> Result<Config, ConfigError> {
     let mut cfg = Config::default();
     let mut worker_processes: Option<usize> = None;
@@ -455,6 +462,7 @@ fn parse_main(directives: &[Directive]) -> Result<Config, ConfigError> {
     Ok(cfg)
 }
 
+/// 解析 event {}：use 和 worker_connections。
 fn parse_event(d: &Directive, cfg: &mut Config) -> Result<(), ConfigError> {
     if !d.args.is_empty() {
         return Err(ConfigError::new(d.line, "event must not have arguments"));
@@ -512,6 +520,7 @@ fn parse_event(d: &Directive, cfg: &mut Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 解析 http {}：upstream、server 和 http_body_max_size。
 fn parse_http(d: &Directive) -> Result<HttpConfig, ConfigError> {
     if !d.args.is_empty() {
         return Err(ConfigError::new(d.line, "http must not have arguments"));
@@ -557,6 +566,7 @@ fn parse_http(d: &Directive) -> Result<HttpConfig, ConfigError> {
     Ok(http)
 }
 
+/// 解析 upstream {}：server 节点和 keepalive 参数。
 fn parse_upstream(d: &Directive) -> Result<UpstreamConfig, ConfigError> {
     if d.args.len() != 1 {
         return Err(ConfigError::new(
@@ -565,7 +575,6 @@ fn parse_upstream(d: &Directive) -> Result<UpstreamConfig, ConfigError> {
         ));
     }
     if !d.children.is_empty() {
-        // ok
     } else {
         return Err(ConfigError::new(d.line, "upstream block is empty"));
     }
@@ -629,6 +638,7 @@ fn parse_upstream(d: &Directive) -> Result<UpstreamConfig, ConfigError> {
     Ok(out)
 }
 
+/// 解析单个 upstream server 及 weight、backup、down 等参数。
 fn parse_peer(d: &Directive) -> Result<PeerConfig, ConfigError> {
     if d.args.is_empty() {
         return Err(ConfigError::new(
@@ -671,6 +681,7 @@ fn parse_peer(d: &Directive) -> Result<PeerConfig, ConfigError> {
     Ok(peer)
 }
 
+/// 解析 server {}：listen、server_name 和 location。
 fn parse_server(d: &Directive) -> Result<ServerConfig, ConfigError> {
     if !d.args.is_empty() {
         return Err(ConfigError::new(d.line, "server must not have arguments"));
@@ -725,6 +736,7 @@ fn parse_server(d: &Directive) -> Result<ServerConfig, ConfigError> {
     })
 }
 
+/// 解析 location {}：proxy_pass、头部、超时和透传开关。
 fn parse_location(d: &Directive) -> Result<LocationConfig, ConfigError> {
     if d.args.len() != 1 {
         return Err(ConfigError::new(
@@ -825,8 +837,6 @@ fn parse_location(d: &Directive) -> Result<LocationConfig, ConfigError> {
         }
     }
 
-    // A location that only sets proxy_* options without proxy_pass is valid:
-    // it falls through to the built-in default response, like the original.
     if !proxy_pass_seen {
         proxy = None;
     }
@@ -838,10 +848,7 @@ fn parse_location(d: &Directive) -> Result<LocationConfig, ConfigError> {
     })
 }
 
-/* ------------------------------------------------------------------ */
-/* Value parsers                                                      */
-/* ------------------------------------------------------------------ */
-
+/// 要求指令只有一个参数并返回它。
 fn one_arg(d: &Directive) -> Result<&str, ConfigError> {
     if d.args.len() != 1 {
         return Err(ConfigError::new(
@@ -852,21 +859,25 @@ fn one_arg(d: &Directive) -> Result<&str, ConfigError> {
     Ok(&d.args[0])
 }
 
+/// 解析非负整数。
 fn parse_usize(v: &str, line: usize, what: &str) -> Result<usize, ConfigError> {
     v.parse::<usize>()
         .map_err(|_| ConfigError::new(line, format!("{} must be a non-negative integer", what)))
 }
 
+/// 解析 u32 整数。
 fn parse_u32(v: &str, line: usize, what: &str) -> Result<u32, ConfigError> {
     v.parse::<u32>()
         .map_err(|_| ConfigError::new(line, format!("{} must be a non-negative integer", what)))
 }
 
+/// 解析 i64 整数。
 fn parse_i64(v: &str, line: usize, what: &str) -> Result<i64, ConfigError> {
     v.parse::<i64>()
         .map_err(|_| ConfigError::new(line, format!("{} must be an integer", what)))
 }
 
+/// 解析 on/off 布尔值。
 fn parse_on_off(v: &str, line: usize, what: &str) -> Result<bool, ConfigError> {
     if v.eq_ignore_ascii_case("on") {
         Ok(true)
@@ -880,8 +891,7 @@ fn parse_on_off(v: &str, line: usize, what: &str) -> Result<bool, ConfigError> {
     }
 }
 
-/// Parse a byte size. Bare integers are bytes; suffixes k/K/m/M/g/G are
-/// accepted, optionally followed by "b".
+/// 解析字节大小，支持 k/m/g 后缀。
 fn parse_size(v: &str, line: usize, what: &str) -> Result<u64, ConfigError> {
     let s = v.trim();
     let lower = s.to_ascii_lowercase();
@@ -907,8 +917,7 @@ fn parse_size(v: &str, line: usize, what: &str) -> Result<u64, ConfigError> {
         .ok_or_else(|| ConfigError::new(line, format!("{} is too large", what)))
 }
 
-/// Milliseconds. Bare numbers are milliseconds (matching the original
-/// proxy_*_timeout directives); "s"/"ms" suffixes are also accepted.
+/// 解析毫秒时长，支持 ms/s 后缀。
 fn parse_msec(v: &str, line: usize, what: &str) -> Result<Duration, ConfigError> {
     let s = v.trim().to_ascii_lowercase();
     let ms = if let Some(n) = s.strip_suffix("ms") {
@@ -925,7 +934,7 @@ fn parse_msec(v: &str, line: usize, what: &str) -> Result<Duration, ConfigError>
     Ok(Duration::from_millis(ms))
 }
 
-/// fail_timeout follows the original semantics: bare number = seconds.
+/// 解析失败冷却时间；裸数字按秒处理。
 fn parse_fail_timeout(v: &str, line: usize) -> Result<Duration, ConfigError> {
     let s = v.trim().to_ascii_lowercase();
     if let Some(n) = s.strip_suffix("ms") {
@@ -946,6 +955,7 @@ fn parse_fail_timeout(v: &str, line: usize) -> Result<Duration, ConfigError> {
     }
 }
 
+/// 解析 listen 的端口或地址:端口形式。
 fn parse_listen(v: &str, line: usize) -> Result<(Option<IpAddr>, u16), ConfigError> {
     let s = v.trim();
     if let Ok(port) = s.parse::<u16>() {
@@ -987,6 +997,7 @@ fn parse_listen(v: &str, line: usize) -> Result<(Option<IpAddr>, u16), ConfigErr
     Ok((Some(ip), port))
 }
 
+/// 拆分 host:port，支持 IPv6 方括号写法。
 fn split_host_port(v: &str, default_port: u16, line: usize) -> Result<(String, u16), ConfigError> {
     let s = v.trim();
     if s.is_empty() {
@@ -1020,6 +1031,7 @@ fn split_host_port(v: &str, default_port: u16, line: usize) -> Result<(String, u
     Ok((s.to_string(), default_port))
 }
 
+/// 校验 HTTP 头名称是否合法。
 fn validate_header_name(name: &str, line: usize) -> Result<(), ConfigError> {
     if name.is_empty() {
         return Err(ConfigError::new(line, "header name must not be empty"));
@@ -1053,6 +1065,7 @@ fn validate_header_name(name: &str, line: usize) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// proxy_pass URL 的解析结果。
 struct ParsedProxyUrl {
     host: String,
     port: u16,
@@ -1060,6 +1073,7 @@ struct ParsedProxyUrl {
     upstream_name: Option<String>,
 }
 
+/// 解析 http://host[:port][/path] 形式的代理地址。
 fn parse_proxy_url(raw: &str, line: usize) -> Result<ParsedProxyUrl, ConfigError> {
     let s = raw.trim();
     if s.is_empty() {
@@ -1108,8 +1122,6 @@ fn parse_proxy_url(raw: &str, line: usize) -> Result<ParsedProxyUrl, ConfigError
         return Err(ConfigError::new(line, "proxy_pass URL has an empty host"));
     }
 
-    // The original treats a host without a dot on port 80 as an upstream {}
-    // reference candidate. We do the same, then fall back to a direct host.
     let upstream_name = if port == 80 && !host.contains('.') && !host.contains(':') {
         Some(host.clone())
     } else {
@@ -1124,20 +1136,19 @@ fn parse_proxy_url(raw: &str, line: usize) -> Result<ParsedProxyUrl, ConfigError
     })
 }
 
-/* ------------------------------------------------------------------ */
-/* Tests                                                              */
-/* ------------------------------------------------------------------ */
-
+// 配置解析单元测试。
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 测试辅助：解析配置文本。
     fn parse(text: &str) -> Result<Config, ConfigError> {
         let mut lexer = Lexer::new(text);
         let dirs = parse_directives(&mut lexer, false)?;
         parse_main(&dirs)
     }
 
+    /// 验证完整配置的解析结果。
     #[test]
     fn parses_basic_config() {
         let cfg = parse(
@@ -1182,6 +1193,7 @@ mod tests {
         );
     }
 
+    /// 验证引号值和普通值都能正确解析。
     #[test]
     fn quoted_and_unquoted_values() {
         let cfg = parse(
@@ -1206,6 +1218,7 @@ mod tests {
         assert_eq!(p.set_headers[0].1, "hello world");
     }
 
+    /// 验证重复指令会被拒绝。
     #[test]
     fn rejects_duplicate_directives() {
         let err = parse("worker_processes 1; worker_processes 2;").unwrap_err();

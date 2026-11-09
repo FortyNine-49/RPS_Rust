@@ -1,5 +1,4 @@
-//! HTTP reverse proxying and WebSocket tunnelling.
-
+//! 代理核心：构造上游请求、选择节点、转发响应、chunked 中继和 WebSocket 隧道。
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -14,8 +13,10 @@ use crate::log;
 use crate::server::App;
 use crate::upstream::UpstreamGroup;
 
+// 转发响应体时使用的缓冲区大小。
 const RELAY_BUF: usize = 16 * 1024;
 
+// 转发请求时需要跳过的连接级和协议级头。
 const SKIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -29,6 +30,7 @@ const SKIP_REQUEST_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+// WebSocket 握手头单独构造，转发原始头时跳过。
 const SKIP_WS_HEADERS: &[&str] = &[
     "sec-websocket-key",
     "sec-websocket-version",
@@ -36,19 +38,18 @@ const SKIP_WS_HEADERS: &[&str] = &[
     "sec-websocket-extensions",
 ];
 
+/// 代理结果：客户端连接是否可继续 keepalive。
 pub struct ProxyOutcome {
     pub client_keepalive: bool,
 }
 
+/// 判断请求是否为 WebSocket 升级请求。
 pub fn is_websocket_request(req: &Request) -> bool {
     req.header_contains_token("upgrade", "websocket")
         && req.header_contains_token("connection", "upgrade")
 }
 
-/* ------------------------------------------------------------------ */
-/* HTTP proxy                                                         */
-/* ------------------------------------------------------------------ */
-
+/// 处理一次 HTTP 代理请求，负责选节点、重试和错误响应。
 pub async fn handle_http<W: AsyncWrite + Unpin>(
     writer: &mut W,
     app: &App,
@@ -125,8 +126,6 @@ pub async fn handle_http<W: AsyncWrite + Unpin>(
                     return outcome;
                 }
                 Err(failure) => {
-                    // A dead cached connection is a common and harmless case:
-                    // retry once on a brand-new connection to the same peer.
                     if failure.used_pooled
                         && !failure.response_started
                         && failure.error.status == 502
@@ -169,6 +168,7 @@ pub async fn handle_http<W: AsyncWrite + Unpin>(
     }
 }
 
+/// 根据 proxy_pass 名称查找 upstream 组。
 fn resolve_group<'a>(app: &'a App, proxy: &ProxyConfig) -> Option<&'a Arc<UpstreamGroup>> {
     proxy
         .upstream_name
@@ -176,6 +176,7 @@ fn resolve_group<'a>(app: &'a App, proxy: &ProxyConfig) -> Option<&'a Arc<Upstre
         .and_then(|name| app.upstreams.get(name))
 }
 
+/// 单次上游尝试的失败信息。
 struct AttemptFailure {
     error: HttpError,
     connect_failed: bool,
@@ -183,12 +184,14 @@ struct AttemptFailure {
     response_started: bool,
 }
 
+/// 已建立的上游连接及池相关状态。
 struct OpenConn {
     reader: BufReader<TcpStream>,
     used_pooled: bool,
     uses: usize,
 }
 
+/// 优先从连接池取连接，否则新建 TCP 连接。
 async fn open_connection(
     app: &App,
     group: Option<&Arc<UpstreamGroup>>,
@@ -248,7 +251,7 @@ async fn open_connection(
     })
 }
 
-/// Returns true when `try_read` reports no pending data and no EOF/error.
+/// 用非阻塞读探测缓存连接是否仍然可用。
 fn stream_looks_alive(stream: &TcpStream) -> bool {
     let mut byte = [0u8; 1];
     matches!(
@@ -257,6 +260,7 @@ fn stream_looks_alive(stream: &TcpStream) -> bool {
     )
 }
 
+/// 完成一次完整上游尝试：发送请求、读取并转发响应。
 #[allow(clippy::too_many_arguments)]
 async fn attempt_http<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -385,6 +389,7 @@ async fn attempt_http<W: AsyncWrite + Unpin>(
     Ok(ProxyOutcome { client_keepalive })
 }
 
+/// 把后端响应头和 body 流式转发给客户端。
 async fn forward_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(
     writer: &mut W,
     req: &Request,
@@ -404,7 +409,6 @@ async fn forward_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(
     for h in &head.headers {
         let lname = h.name.to_ascii_lowercase();
         if lname == "transfer-encoding" {
-            // We re-add it below when the body is chunked.
             continue;
         }
         if lname == "content-length" {
@@ -459,6 +463,7 @@ async fn forward_response<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(
     flush_client(writer, proxy.send_timeout).await
 }
 
+/// 向客户端发送代理错误响应。
 pub async fn send_error<W: AsyncWrite + Unpin>(writer: &mut W, req: &Request, err: &HttpError) {
     if err.status == 499 {
         return;
@@ -485,10 +490,12 @@ pub async fn send_error<W: AsyncWrite + Unpin>(writer: &mut W, req: &Request, er
     .await;
 }
 
+/// 把 HttpError 转换为 io::Error。
 fn http_error_to_io(e: HttpError) -> std::io::Error {
     std::io::Error::other(e.message)
 }
 
+/// 转义错误页中的 HTML 特殊字符。
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -503,10 +510,7 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-/* ------------------------------------------------------------------ */
-/* Upstream request construction                                      */
-/* ------------------------------------------------------------------ */
-
+/// 构造发往后端的 HTTP 请求。
 #[allow(clippy::too_many_arguments)]
 fn build_http_request(
     req: &Request,
@@ -543,7 +547,6 @@ fn build_http_request(
 
     push_header(&mut out, "Host", &host_header);
 
-    // X-Real-IP is passed through when the client already supplied one.
     if req.header("x-real-ip").is_none() && !set_names.contains("x-real-ip") {
         push_header(&mut out, "X-Real-IP", &remote_ip.to_string());
     }
@@ -583,8 +586,7 @@ fn build_http_request(
     out
 }
 
-/// Build the upstream request line target. Like the original, a path in
-/// `proxy_pass` replaces the client path while query arguments are appended.
+/// 计算转发给后端的路径，并拼接 query。
 fn build_target_path(proxy: &ProxyConfig, req: &Request) -> String {
     let (base, has_query) = match &proxy.target_uri {
         Some(t) => (t.clone(), t.contains('?')),
@@ -599,6 +601,7 @@ fn build_target_path(proxy: &ProxyConfig, req: &Request) -> String {
     }
 }
 
+/// 根据直连或 upstream 组构造 Host 头。
 fn build_host_header(host: &str, port: u16, is_group: bool) -> String {
     let needs_port = is_group || port != 80;
     if !needs_port {
@@ -611,6 +614,7 @@ fn build_host_header(host: &str, port: u16, is_group: bool) -> String {
     }
 }
 
+/// 追加客户端原始头，并跳过已覆盖或连接级头。
 fn append_origin_headers(
     out: &mut Vec<u8>,
     req: &Request,
@@ -635,6 +639,7 @@ fn append_origin_headers(
     }
 }
 
+/// 向请求缓冲区写入一个经过清洗的头。
 fn push_header(out: &mut Vec<u8>, name: &str, value: &str) {
     out.extend_from_slice(name.as_bytes());
     out.extend_from_slice(b": ");
@@ -642,6 +647,7 @@ fn push_header(out: &mut Vec<u8>, name: &str, value: &str) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// 变量展开上下文。
 struct VarCtx<'a> {
     req: &'a Request,
     remote_ip: IpAddr,
@@ -651,6 +657,7 @@ struct VarCtx<'a> {
     local_port: u16,
 }
 
+/// 展开 proxy_set_header 中的变量。
 fn expand_vars(template: &str, ctx: &VarCtx) -> String {
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::with_capacity(template.len());
@@ -694,6 +701,7 @@ fn expand_vars(template: &str, ctx: &VarCtx) -> String {
     out
 }
 
+/// 解析单个变量的值。
 fn lookup_var(name: &str, ctx: &VarCtx) -> String {
     match name {
         "host" => ctx
@@ -728,6 +736,7 @@ fn lookup_var(name: &str, ctx: &VarCtx) -> String {
     }
 }
 
+/// 去掉 Host 头中的端口。
 fn host_without_port(host: &str) -> String {
     if host.starts_with('[') {
         if let Some(end) = host.find(']') {
@@ -742,10 +751,7 @@ fn host_without_port(host: &str) -> String {
     host.to_string()
 }
 
-/* ------------------------------------------------------------------ */
-/* Relay helpers                                                      */
-/* ------------------------------------------------------------------ */
-
+/// 带超时地从上游读取数据。
 async fn read_upstream<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -761,6 +767,7 @@ async fn read_upstream<R: AsyncRead + Unpin>(
     }
 }
 
+/// 带超时地从上游读取固定长度数据。
 async fn read_exact_upstream<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -776,6 +783,7 @@ async fn read_exact_upstream<R: AsyncRead + Unpin>(
     }
 }
 
+/// 带超时地向上游写入数据。
 async fn write_upstream<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
@@ -791,6 +799,7 @@ async fn write_upstream<W: AsyncWrite + Unpin>(
     }
 }
 
+/// 带超时地向客户端写入数据。
 async fn write_client<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
@@ -803,6 +812,7 @@ async fn write_client<W: AsyncWrite + Unpin>(
     }
 }
 
+/// 带超时地刷新客户端输出。
 async fn flush_client<W: AsyncWrite + Unpin>(
     writer: &mut W,
     timeout: Duration,
@@ -814,6 +824,7 @@ async fn flush_client<W: AsyncWrite + Unpin>(
     }
 }
 
+/// 按 Content-Length 精确转发指定字节数。
 async fn relay_exact<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
@@ -836,6 +847,7 @@ async fn relay_exact<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// 一直转发到上游关闭。
 async fn relay_until_eof<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
@@ -852,6 +864,7 @@ async fn relay_until_eof<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+/// 原样中继 chunked 响应体。
 async fn relay_chunked<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
@@ -890,6 +903,7 @@ async fn relay_chunked<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+/// 带超时地读取一行 chunked 协议数据。
 async fn read_wire_line_timed<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     timeout: Duration,
@@ -907,6 +921,7 @@ async fn read_wire_line_timed<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// 去掉字节行末尾的 CR/LF。
 fn strip_eol_bytes(mut line: &[u8]) -> &[u8] {
     if line.last() == Some(&b'\n') {
         line = &line[..line.len() - 1];
@@ -917,14 +932,12 @@ fn strip_eol_bytes(mut line: &[u8]) -> &[u8] {
     line
 }
 
+/// 判断是否为空行。
 fn is_empty_line(line: &[u8]) -> bool {
     line == b"\r\n" || line == b"\n"
 }
 
-/* ------------------------------------------------------------------ */
-/* WebSocket proxy                                                    */
-/* ------------------------------------------------------------------ */
-
+/// 完成 WebSocket 握手并进入双向裸转发。
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_websocket(
     mut client: BufReader<TcpStream>,
@@ -1037,7 +1050,6 @@ pub async fn handle_websocket(
         };
 
         if head.status == 101 {
-            // Raw passthrough of the handshake response.
             write_client(client.get_mut(), &raw, proxy.send_timeout)
                 .await
                 .map_err(http_error_to_io)?;
@@ -1073,7 +1085,6 @@ pub async fn handle_websocket(
             return Ok(());
         }
 
-        // Backend refused the upgrade: relay its HTTP response, then close.
         let framing = match http::response_framing(&req.head.method, &head) {
             Ok(f) => f,
             Err(e) => {
@@ -1105,6 +1116,7 @@ pub async fn handle_websocket(
     Ok(())
 }
 
+/// 构造 WebSocket 升级请求。
 #[allow(clippy::too_many_arguments)]
 fn build_ws_request(
     req: &Request,

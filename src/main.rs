@@ -1,10 +1,4 @@
-//! RPS — a lightweight nginx-style HTTP reverse proxy, rewritten in Rust.
-//!
-//! The command line interface and configuration language are compatible with
-//! the original C implementation:
-//!
-//!   rps -c <config> [-l 0..8] [-p <prefix>] [-t] [-s stop]
-
+//! 程序入口：解析命令行、初始化日志与运行时，处理 daemon/PID/信号并启动服务器。
 mod config;
 mod http;
 mod log;
@@ -22,6 +16,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use tokio::sync::watch;
 
+/// 命令行参数：配置文件、prefix、日志级别、测试与停止标志。
 struct Cli {
     conf: Option<String>,
     prefix: Option<String>,
@@ -30,6 +25,7 @@ struct Cli {
     stop: bool,
 }
 
+/// 程序入口，把运行结果转换为退出码。
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -40,6 +36,7 @@ fn main() -> ExitCode {
     }
 }
 
+/// 解析参数并依次完成配置加载、daemon、PID 锁和服务器启动。
 fn real_main() -> Result<(), String> {
     let cli = parse_args()?;
 
@@ -107,8 +104,6 @@ fn real_main() -> Result<(), String> {
             .enable_all()
             .build(),
         config::UseMode::Thread => tokio::runtime::Builder::new_multi_thread()
-            // Connection handling runs on dedicated OS threads; the runtime
-            // only drives the accept loops and signal handling.
             .worker_threads(1)
             .enable_all()
             .build(),
@@ -143,6 +138,7 @@ fn real_main() -> Result<(), String> {
     Ok(())
 }
 
+/// 解析 -c、-l、-p、-t、-s 等命令行参数。
 fn parse_args() -> Result<Cli, String> {
     let mut cli = Cli {
         conf: None,
@@ -167,8 +163,7 @@ fn parse_args() -> Result<Cli, String> {
                 let v = args
                     .get(i)
                     .ok_or_else(|| "\"-l\" requires a level from 0 to 8".to_string())?;
-                // Match the original atoi() behavior: a non-numeric value
-                // becomes 0; out-of-range values downgrade to DEBUG.
+
                 let n = v.parse::<i32>().unwrap_or(0);
                 cli.log_level = Some(if (0..=8).contains(&n) {
                     n as u8
@@ -209,6 +204,7 @@ fn parse_args() -> Result<Cli, String> {
     Ok(cli)
 }
 
+/// 打印命令行帮助。
 fn print_help() {
     println!(
         "RPS - lightweight HTTP reverse proxy (Rust rewrite)\n\
@@ -223,12 +219,14 @@ fn print_help() {
     );
 }
 
+/// 应用命令行指定的日志级别。
 fn apply_log_level(level: Option<u8>) {
     if let Some(level) = level {
         log::set_level(level);
     }
 }
 
+/// 把相对路径转换为基于当前目录的绝对路径。
 fn resolve_path(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -240,10 +238,7 @@ fn resolve_path(path: &Path) -> Result<PathBuf, String> {
     Ok(absolute)
 }
 
-/* ------------------------------------------------------------------ */
-/* PID file                                                           */
-/* ------------------------------------------------------------------ */
-
+/// PID 文件守卫：持有独立 lock 文件，退出时自动清理。
 struct PidGuard {
     path: PathBuf,
     lock_path: PathBuf,
@@ -251,7 +246,9 @@ struct PidGuard {
     pid: u32,
 }
 
+/// PID 文件守卫的创建逻辑。
 impl PidGuard {
+    /// 创建 lock 文件并加锁，然后写入当前进程 PID。
     fn acquire(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -265,8 +262,6 @@ impl PidGuard {
             }
         }
 
-        // Use a separate lock file. An exclusive Windows byte-range lock on the
-        // pid file itself would also block `-s stop` from reading the pid.
         let mut lock_name = path.as_os_str().to_os_string();
         lock_name.push(".lock");
         let lock_path = PathBuf::from(lock_name);
@@ -314,7 +309,9 @@ impl PidGuard {
     }
 }
 
+/// 退出时清理 PID 文件和锁文件。
 impl Drop for PidGuard {
+    /// 仅当 pid 文件仍记录当前进程时删除它。
     fn drop(&mut self) {
         if current_pid_in_file(&self.path) == Some(self.pid) {
             let _ = fs::remove_file(&self.path);
@@ -324,16 +321,14 @@ impl Drop for PidGuard {
     }
 }
 
+/// 读取 pid 文件中的进程号。
 fn current_pid_in_file(path: &Path) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
-/* ------------------------------------------------------------------ */
-/* Daemon / stop                                                      */
-/* ------------------------------------------------------------------ */
-
+/// 启动分离子进程，实现 daemon 模式。
 fn daemonize() -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("failed to locate the rps executable: {}", e))?;
@@ -348,6 +343,7 @@ fn daemonize() -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // Windows 进程创建标志：脱离控制台并建立新进程组。
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -370,6 +366,7 @@ fn daemonize() -> Result<(), String> {
     Ok(())
 }
 
+/// 读取 PID 并发送终止信号，超时后强制结束。
 fn stop_daemon(pid_path: &Path) -> Result<(), String> {
     let mut content = String::new();
     File::open(pid_path)
@@ -426,6 +423,7 @@ fn stop_daemon(pid_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 轮询等待进程退出。
 fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -437,11 +435,13 @@ fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
     !process_alive(pid)
 }
 
+/// Unix 下用 kill(pid, 0) 判断进程是否存活。
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Windows 下用 tasklist 判断进程是否存活。
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
     let filter = format!("PID eq {}", pid);
@@ -457,10 +457,7 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Signals                                                            */
-/* ------------------------------------------------------------------ */
-
+/// Unix 下等待 SIGTERM、SIGINT 或 SIGQUIT。
 #[cfg(unix)]
 async fn wait_for_signal() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -494,6 +491,7 @@ async fn wait_for_signal() {
     }
 }
 
+/// Windows 下等待 Ctrl-C。
 #[cfg(windows)]
 async fn wait_for_signal() {
     if let Err(e) = tokio::signal::ctrl_c().await {
