@@ -1,0 +1,25 @@
+[package]
+name = "rps"
+version = "0.1.0"
+edition = "2021"
+description = "RPS — a lightweight nginx-style HTTP reverse proxy, rewritten in Rust"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+    "macros",
+] }
+fs2 = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
